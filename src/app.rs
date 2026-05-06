@@ -6,7 +6,7 @@ use tokio::runtime::Runtime; // NEW IMPORT
 
 use crate::api::{fetch_release_assets, fetch_repo_releases};
 use crate::config::{AppConfig, load_config, save_config};
-use crate::types::{AppTab, AsyncMessage, HomeState, Project};
+use crate::types::{AppTab, AsyncMessage, HomeState, Project, ReleaseMetadata};
 
 pub struct GrmApp {
     active_tab: AppTab,
@@ -56,10 +56,10 @@ impl GrmApp {
 
         self.rt.spawn(async move {
             match fetch_repo_releases(&repo_name).await {
-                Ok(versions) => {
+                Ok(releases) => {
                     let _ = tx.send(AsyncMessage::FetchComplete {
                         repo_name,
-                        versions,
+                        releases,
                     });
                 }
                 Err(e) => {
@@ -70,20 +70,41 @@ impl GrmApp {
         });
     }
 
-    fn trigger_asset_fetch(&mut self, repo_name: String, version: String, ctx: egui::Context) {
+    fn trigger_fetch_latest(&mut self, repo_name: String, allow_prerelease: bool, ctx: egui::Context) {
+        self.home_state = HomeState::FetchingLatest { repo_name: repo_name.clone(), allow_prerelease };
+        let tx = self.tx.clone();
+        
+        self.rt.spawn(async move {
+            match fetch_repo_releases(&repo_name).await {
+                Ok(releases) => { let _ = tx.send(AsyncMessage::FetchComplete { repo_name, releases }); }
+                Err(e) => { let _ = tx.send(AsyncMessage::FetchError(e)); }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn trigger_asset_fetch(
+        &mut self,
+        repo_name: String,
+        release: ReleaseMetadata,
+        auto_update: bool, // NEW PARAMETER
+        ctx: egui::Context,
+    ) {
         self.home_state = HomeState::FetchingAssets {
             repo_name: repo_name.clone(),
-            version: version.clone(),
+            release: release.clone(),
+            auto_update, // SAVE IT IN STATE
         };
         let tx = self.tx.clone();
 
         self.rt.spawn(async move {
-            match fetch_release_assets(&repo_name, &version).await {
+            match crate::api::fetch_release_assets(&repo_name, &release.tag_name).await {
                 Ok(assets) => {
                     let _ = tx.send(AsyncMessage::FetchAssetsComplete {
                         repo_name,
-                        version,
+                        release,
                         assets,
+                        auto_update, // PASS IT TO THE MESSAGE
                     });
                 }
                 Err(e) => {
@@ -93,18 +114,28 @@ impl GrmApp {
             ctx.request_repaint();
         });
     }
-
-    fn trigger_download(&mut self, url: String, file_name: String, size: u64, ctx: egui::Context) {
+    fn trigger_download(
+        &mut self,
+        url: String,
+        file_name: String,
+        size: u64,
+        repo_name: String,
+        release: ReleaseMetadata,
+        ctx: egui::Context,
+    ) {
         let tx = self.tx.clone();
         let background_ctx = ctx.clone();
         let target_dir = self.config.install_folder.clone();
 
         self.rt.spawn(async move {
+            // Pass the extra context into the api call
             if let Err(e) = crate::api::download_asset(
                 url,
                 file_name.clone(),
                 size,
                 target_dir,
+                repo_name,
+                release,
                 tx.clone(),
                 background_ctx.clone(),
             )
@@ -118,7 +149,8 @@ impl GrmApp {
             }
         });
 
-        self.active_tab = AppTab::Tasks; // Go to Tasks tab
+        self.active_tab = AppTab::Tasks;
+        self.home_state = HomeState::Overview; // Reset the Home view so it's clean when we return!
     }
 }
 
@@ -126,27 +158,68 @@ impl eframe::App for GrmApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_zoom_factor(self.config.ui_zoom_factor);
 
+        // NEW: We use this to trigger a download safely outside the message loop
+        let mut auto_download_trigger = None;
+
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AsyncMessage::FetchComplete {
                     repo_name,
-                    versions,
+                    releases,
                 } => {
-                    self.home_state = HomeState::Selection {
-                        repo_name,
-                        available_versions: versions,
-                    };
+                    let mut auto_update = None;
+                    if let HomeState::FetchingLatest { allow_prerelease, .. } = &self.home_state {
+                        auto_update = Some(*allow_prerelease);
+                    }
+
+                    if let Some(allow_prerelease) = auto_update {
+                        let latest = releases.into_iter().find(|r| {
+                            if allow_prerelease { !r.draft } else { !r.draft && !r.prerelease }
+                        });
+
+                        if let Some(release) = latest {
+                            // Pass 'true' for auto_update
+                            self.trigger_asset_fetch(repo_name, release, true, ctx.clone());
+                        } else {
+                            self.home_state = HomeState::Error { message: "No suitable releases found on GitHub.".to_string() };
+                        }
+                    } else {
+                        self.home_state = HomeState::Selection { repo_name, available_releases: releases };
+                    }
                 }
                 AsyncMessage::FetchAssetsComplete {
                     repo_name,
-                    version,
+                    release,
                     assets,
+                    auto_update,
                 } => {
-                    self.home_state = HomeState::AssetSelection {
-                        repo_name,
-                        version,
-                        assets,
-                    };
+                    let mut found_match = false;
+
+                    // IF AUTO UPDATING: Check Regex!
+                    if auto_update {
+                        if let Some(project) = self.projects.iter().find(|p| p.repo_name == repo_name) {
+                            if let Some(pattern) = &project.asset_regex {
+                                if let Ok(re) = regex::Regex::new(pattern) {
+                                    if let Some(asset) = assets.iter().find(|a| re.is_match(&a.name)) {
+                                        auto_download_trigger = Some((
+                                            asset.download_url.clone(), asset.name.clone(), asset.size,
+                                            repo_name.clone(), release.clone(),
+                                        ));
+                                        found_match = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If not auto-updating, or regex failed, go to selection screen
+                    if !found_match {
+                        self.home_state = HomeState::AssetSelection {
+                            repo_name,
+                            release,
+                            assets,
+                        };
+                    }
                 }
                 AsyncMessage::FetchError(err) => {
                     self.home_state = HomeState::Error { message: err };
@@ -164,11 +237,54 @@ impl eframe::App for GrmApp {
                     }
                     ctx.request_repaint(); // Tell the UI to redraw immediately for smooth animation
                 }
-                AsyncMessage::DownloadComplete(name) => {
-                    // For now, let's just push it to 100% and keep it in the list so the user sees it finished
-                    if let Some(p) = self.active_tasks.get_mut(&name) {
+                AsyncMessage::DownloadComplete {
+                    file_name,
+                    repo_name,
+                    release,
+                } => {
+                    if let Some(p) = self.active_tasks.get_mut(&file_name) {
                         *p = 1.0;
                     }
+
+                    // --- THE MANIFEST MAGIC ---
+                    // 1. Check if the project already exists in our tracked list
+                    let mut found = false;
+                    for project in &mut self.projects {
+                        if project.repo_name == repo_name {
+                            project.version = release.tag_name.clone();
+                            project.release_info = Some(release.clone());
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    // 2. If it's a new project, add it!
+                    if !found {
+                        let parts: Vec<&str> = repo_name.split('/').collect();
+                        let owner = if parts.len() > 1 {
+                            parts[0].to_string()
+                        } else {
+                            "Unknown".to_string()
+                        };
+
+                        self.projects.push(Project {
+                            repo_name: repo_name.clone(),
+                            version: release.tag_name.clone(),
+                            owner,
+                            last_updated: "Just now".to_string(),
+                            readme: format!(
+                                "# {}\n\nDownloaded version: {}",
+                                repo_name, release.tag_name
+                            ),
+                            is_expanded: false,
+                            release_info: Some(release.clone()),
+                            allow_prerelease: false,
+                            asset_regex: None,
+                        });
+                    }
+
+                    // 3. Save it permanently to disk!
+                    crate::manifest::save_manifest(&self.config.install_folder, &self.projects);
                 }
                 AsyncMessage::DownloadError { file_name, error } => {
                     println!("Error downloading {}: {}", file_name, error);
@@ -246,11 +362,14 @@ impl eframe::App for GrmApp {
                 AppTab::Home => {
                     // This variable stores state changes so we don't mutate `self.home_state` while it's borrowed
                     let mut next_home_state = None;
-                    let mut pending_asset_fetch: Option<(String, String)> = None;
-                    let mut pending_download: Option<(String, String, u64)> = None;
-
+                    let mut pending_auto_update: Option<(String, bool)> = None;
+                    let mut pending_custom_fetch: Option<String> = None;
+                    let mut pending_asset_fetch: Option<(String, ReleaseMetadata)> = None;
+                    // UPDATE: Added Option<String> to hold the confirmed regex
+                    let mut pending_download: Option<(String, String, u64, String, ReleaseMetadata, Option<String>)> = None;
+                    let mut updated_regex_string: Option<String> = None;
                     match &self.home_state {
-                        HomeState::Fetching { repo_name } => {
+                        HomeState::Fetching { repo_name } | HomeState::FetchingLatest { repo_name, .. } => {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label(format!("Fetching releases for {}...", repo_name));
@@ -258,7 +377,7 @@ impl eframe::App for GrmApp {
                         }
                         HomeState::Selection {
                             repo_name,
-                            available_versions,
+                            available_releases,
                         } => {
                             ui.horizontal(|ui| {
                                 ui.label(format!("Releases for {}:", repo_name));
@@ -277,20 +396,113 @@ impl eframe::App for GrmApp {
                                         bottom: 0.0,
                                     })
                                     .show(ui, |ui| {
-                                        for version in available_versions {
+                                        for release in available_releases {
+                                            // Display the tag name, and append [DRAFT] or [PRERELEASE] if applicable
+                                            let mut label = release.tag_name.clone();
+                                            if release.draft {
+                                                label.push_str(" [DRAFT]");
+                                            }
+                                            if release.prerelease {
+                                                label.push_str(" [PRERELEASE]");
+                                            }
+
                                             if ui
                                                 .add_sized(
                                                     [ui.available_width(), 0.0],
-                                                    egui::Button::new(version),
+                                                    egui::Button::new(label),
                                                 )
                                                 .clicked()
                                             {
-                                                // UPDATE: Defer the fetch to avoid borrow checker errors
                                                 pending_asset_fetch =
-                                                    Some((repo_name.clone(), version.clone()));
+                                                    Some((repo_name.clone(), release.clone()));
                                             }
                                         }
                                     });
+                            });
+                        }
+                        HomeState::FetchingAssets { repo_name, release, .. } => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!(
+                                    "Finding assets for {} ({}) ...",
+                                    repo_name, release.tag_name
+                                ));
+                            });
+                        }
+                        HomeState::AssetSelection {
+                            repo_name,
+                            release,
+                            assets,
+                        } => {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "Assets for {} ({}):",
+                                    repo_name, release.tag_name
+                                ));
+                                if ui.button("⬅ Back to Versions").clicked() {
+                                    next_home_state = Some(HomeState::Overview);
+                                }
+                            });
+                            ui.separator();
+
+                            if assets.is_empty() {
+                                ui.label("No downloadable assets found for this release.");
+                            } else {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    for asset in assets {
+                                        ui.horizontal(|ui| {
+                                            let mb = asset.size as f64 / 1_048_576.0;
+                                            ui.label(format!("{:.2} MB", mb));
+
+                                            if ui.button(format!("⬇ Download {}", asset.name)).clicked() {
+                                                // INSTEAD OF DOWNLOADING, PROPOSE A REGEX AND GO TO POPUP
+                                                let proposed_regex = asset.name.replace(&release.tag_name, "(.*?)");
+                                                next_home_state = Some(HomeState::ConfirmRegex {
+                                                    repo_name: repo_name.clone(),
+                                                    release: release.clone(),
+                                                    asset: asset.clone(),
+                                                    regex_string: format!("^{}$", proposed_regex),
+                                                });
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                });
+                            }
+                        }
+
+                        // NEW: The Regex Confirmation Popup
+                        HomeState::ConfirmRegex { repo_name, release, asset, regex_string } => {
+                            ui.heading("Confirm Download & Asset Pattern");
+                            ui.separator();
+                            ui.label("To auto-update this project in the future, GRM needs a Regex pattern to identify the correct file.");
+                            ui.add_space(8.0);
+
+                            ui.strong(format!("Selected File: {}", asset.name));
+
+                            ui.horizontal(|ui| {
+                                ui.label("Regex Pattern:");
+                                let mut temp_regex = regex_string.clone();
+                                if ui.add_sized([ui.available_width(), 0.0], egui::TextEdit::singleline(&mut temp_regex)).changed() {
+                                    updated_regex_string = Some(temp_regex);
+                                }
+                            });
+
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Cancel").clicked() {
+                                    next_home_state = Some(HomeState::Overview);
+                                }
+                                if ui.button("Confirm Download & Save Pattern").clicked() {
+                                    pending_download = Some((
+                                        asset.download_url.clone(),
+                                        asset.name.clone(),
+                                        asset.size,
+                                        repo_name.clone(),
+                                        release.clone(),
+                                        Some(regex_string.clone()),
+                                    ));
+                                }
                             });
                         }
                         HomeState::Error { message } => {
@@ -305,7 +517,6 @@ impl eframe::App for GrmApp {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    let mut fetch_target = None;
 
                                     for project in &mut self.projects {
                                         // RESTORED UI: The Card Frame
@@ -319,8 +530,13 @@ impl eframe::App for GrmApp {
                                                 let header_response = ui
                                                     .group(|ui| {
                                                         ui.horizontal(|ui| {
-                                                            ui.strong(&project.repo_name)
-                                                                .on_hover_text("Repository Name");
+                                                            // --- OWNER/REPO VISUAL POLISH ---
+                                                            ui.horizontal(|ui| {
+                                                                ui.spacing_mut().item_spacing.x = 0.0;
+                                                                ui.label(format!("{}/", project.owner));
+                                                                let repo_only = project.repo_name.split('/').last().unwrap_or(&project.repo_name);
+                                                                ui.strong(repo_only);
+                                                            }).response.on_hover_text("Repository Name");
                                                             ui.with_layout(
                                                                 egui::Layout::right_to_left(
                                                                     egui::Align::Center,
@@ -360,14 +576,31 @@ impl eframe::App for GrmApp {
 
                                                 if project.is_expanded {
                                                     ui.add_space(8.0);
+                                                    
+                                                    // --- THE NEW BUTTON LAYOUT ---
                                                     ui.horizontal(|ui| {
-                                                        if ui
-                                                            .button("Fetch Versions / Update")
-                                                            .clicked()
-                                                        {
-                                                            fetch_target =
-                                                                Some(project.repo_name.clone());
+                                                        // LEFT SIDE: Auto Update & Checkbox
+                                                        let update_btn = ui.add(
+                                                            egui::Button::new("⬆ Update")
+                                                                .fill(egui::Color32::from_rgb(30, 100, 40)) // Dark Green
+                                                        );
+                                                        if update_btn.on_hover_text("Automatically fetches the latest version and takes you to the download").clicked() {
+                                                            pending_auto_update = Some((project.repo_name.clone(), project.allow_prerelease));
                                                         }
+                                                        
+                                                        ui.checkbox(&mut project.allow_prerelease, "Pre-releases")
+                                                            .on_hover_text("Include Beta/Alpha versions when finding the latest update");
+
+                                                        // RIGHT SIDE: Custom Version
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            let custom_btn = ui.add(
+                                                                egui::Button::new("⚙ Custom Version")
+                                                                    .fill(egui::Color32::from_rgb(40, 80, 140)) // Dark Blue
+                                                            );
+                                                            if custom_btn.on_hover_text("View all available versions manually").clicked() {
+                                                                pending_custom_fetch = Some(project.repo_name.clone());
+                                                            }
+                                                        });
                                                     });
                                                     ui.separator();
 
@@ -392,77 +625,43 @@ impl eframe::App for GrmApp {
                                         ui.add_space(8.0);
                                     }
 
-                                    if let Some(repo) = fetch_target {
-                                        self.trigger_fetch(repo, ctx.clone());
-                                    }
                                 });
-                        }
-                        // NEW: Spinner for fetching assets
-                        HomeState::FetchingAssets { repo_name, version } => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(format!(
-                                    "Finding assets for {} ({}) ...",
-                                    repo_name, version
-                                ));
-                            });
-                        }
-                        // NEW: The UI showing the actual files!
-                        HomeState::AssetSelection {
-                            repo_name,
-                            version,
-                            assets,
-                        } => {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("Assets for {} ({}):", repo_name, version));
-                                if ui.button("⬅ Back to Versions").clicked() {
-                                    // Let's cheat a bit and re-fetch versions if they hit back,
-                                    // or you can cache them. For now, let's just go to overview.
-                                    next_home_state = Some(HomeState::Overview);
-                                }
-                            });
-                            ui.separator();
-
-                            if assets.is_empty() {
-                                ui.label("No downloadable assets found for this release.");
-                            } else {
-                                egui::ScrollArea::vertical().show(ui, |ui| {
-                                    for asset in assets {
-                                        ui.horizontal(|ui| {
-                                            // Convert bytes to Megabytes
-                                            let mb = asset.size as f64 / 1_048_576.0;
-                                            ui.label(format!("{:.2} MB", mb));
-
-                                            if ui
-                                                .button(format!("⬇ Download {}", asset.name))
-                                                .clicked()
-                                            {
-                                                pending_download = Some((
-                                                    asset.download_url.clone(),
-                                                    asset.name.clone(),
-                                                    asset.size,
-                                                ));
-                                            }
-                                        });
-                                        ui.add_space(4.0);
-                                    }
-                                });
-                            }
                         }
                     }
 
-                    // Apply the state transition if one occurred
                     if let Some(new_state) = next_home_state {
                         self.home_state = new_state;
                     }
-
-                    // NEW: Trigger the asset fetch now that the immutable borrow is dropped
-                    if let Some((repo, version)) = pending_asset_fetch {
-                        self.trigger_asset_fetch(repo, version, ctx.clone());
+                    if let Some(new_regex) = updated_regex_string {
+                        if let HomeState::ConfirmRegex { regex_string, .. } = &mut self.home_state {
+                            *regex_string = new_regex;
+                        }
                     }
 
-                    if let Some((url, name, size)) = pending_download {
-                        self.trigger_download(url, name, size, ctx.clone());
+                    if let Some((repo, allow_pre)) = pending_auto_update {
+                        self.trigger_fetch_latest(repo, allow_pre, ctx.clone());
+                    }
+                    if let Some(repo) = pending_custom_fetch {
+                        self.trigger_fetch(repo, ctx.clone());
+                    }
+                    if let Some((repo, release)) = pending_asset_fetch {
+                        // Pass 'false' for auto_update since they clicked Custom Version
+                        self.trigger_asset_fetch(repo, release, false, ctx.clone());
+                    }
+                    if let Some((url, name, size, repo, release, regex_opt)) = pending_download {
+                        // If they confirmed a regex, save it to the project immediately!
+                        if let Some(regex_str) = regex_opt {
+                            if let Some(proj) = self.projects.iter_mut().find(|p| p.repo_name == repo) {
+                                proj.asset_regex = Some(regex_str);
+                                crate::manifest::save_manifest(&self.config.install_folder, &self.projects);
+                            }
+                        }
+                        self.trigger_download(url, name, size, repo, release, ctx.clone());
+                    }
+
+                    // TRIGGER THE AUTO-DOWNLOAD IF REGEX MATCHED
+                    if let Some((url, name, size, repo, release)) = auto_download_trigger {
+                        self.trigger_download(url, name, size, repo, release, ctx.clone());
                     }
                 }
                 AppTab::Tasks => {

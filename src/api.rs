@@ -1,4 +1,4 @@
-use crate::types::{Asset, AsyncMessage}; // Make sure AsyncMessage is imported
+use crate::types::{Asset, AsyncMessage, ReleaseMetadata}; // Make sure AsyncMessage is imported
 use serde::Deserialize;
 use std::sync::mpsc::Sender;
 use tokio::fs::File;
@@ -11,13 +11,13 @@ struct GitHubRelease {
     tag_name: String,
 }
 
-pub async fn fetch_repo_releases(repo_name: &str) -> Result<Vec<String>, String> {
+pub async fn fetch_repo_releases(repo_name: &str) -> Result<Vec<ReleaseMetadata>, String> {
     let url = format!("https://api.github.com/repos/{}/releases", repo_name);
 
     let client = reqwest::Client::new();
     let response = client
         .get(&url)
-        .header("User-Agent", "GRM-Rust-App") // GitHub requires a User-Agent
+        .header("User-Agent", "GRM-Rust-App")
         .send()
         .await
         .map_err(|e| format!("Network error: {}", e))?;
@@ -26,15 +26,13 @@ pub async fn fetch_repo_releases(repo_name: &str) -> Result<Vec<String>, String>
         return Err(format!("API Error: {}", response.status()));
     }
 
-    let releases: Vec<GitHubRelease> = response
+    // Now we deserialize directly into our robust ReleaseMetadata struct!
+    let releases: Vec<ReleaseMetadata> = response
         .json()
         .await
         .map_err(|e| format!("Parse error: {}", e))?;
 
-    // Extract just the tag names (versions)
-    let versions = releases.into_iter().map(|r| r.tag_name).collect();
-
-    Ok(versions)
+    Ok(releases)
 }
 
 // Internal structs for deserializing the Asset JSON
@@ -93,6 +91,8 @@ pub async fn download_asset(
     file_name: String,
     total_size: u64,
     target_dir: String,
+    repo_name: String,
+    release: ReleaseMetadata,
     tx: Sender<AsyncMessage>,
     ctx: Context,
 ) -> Result<(), String> {
@@ -138,7 +138,11 @@ pub async fn download_asset(
         ctx.request_repaint(); // WAKE UP THE UI THREAD TO ANIMATE THE BAR
     }
 
-    let _ = tx.send(AsyncMessage::DownloadComplete(file_name));
+    let _ = tx.send(AsyncMessage::DownloadComplete {
+        file_name,
+        repo_name,
+        release,
+    });
     ctx.request_repaint(); // WAKE UP THE UI THREAD FOR THE FINAL GREEN CHECKMARK
     Ok(())
 }
