@@ -14,3 +14,13 @@ egui_commonmark = "0.16"
 directories = "6.0.0"
 chrono = "0.4.44"
 regex = "1.12.3"
+walkdir = "2.5"
+
+toml = "0.8"
+nu-cli = { version = "0.112.2", default-features = false }
+nu-command = { version = "0.112.2", default-features = false }
+nu-engine = { version = "0.112.2", default-features = false }
+nu-parser = { version = "0.112.2", default-features = false }
+nu-protocol = { version = "0.112.2", default-features = false }
+nu-std = { version = "0.112.2", default-features = false }
+nu-cmd-lang = { version = "0.112.2" }

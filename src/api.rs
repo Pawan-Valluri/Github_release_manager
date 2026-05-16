@@ -115,7 +115,10 @@ pub async fn download_asset(
         .map_err(|e| format!("File creation error: {}", e))?;
 
     let mut downloaded: u64 = 0;
-    let _ = tx.send(AsyncMessage::DownloadStarted(file_name.clone()));
+    let _ = tx.send(AsyncMessage::DownloadStarted { 
+        repo_name: repo_name.clone(), 
+        file_name: file_name.clone() 
+    });
     ctx.request_repaint(); // WAKE UP THE UI THREAD
 
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
@@ -131,6 +134,7 @@ pub async fn download_asset(
         };
 
         let _ = tx.send(AsyncMessage::DownloadProgress {
+            repo_name: repo_name.clone(),
             file_name: file_name.clone(),
             progress,
         });

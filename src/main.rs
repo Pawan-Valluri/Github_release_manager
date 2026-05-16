@@ -2,6 +2,8 @@ mod api;
 mod app;
 mod config;
 mod manifest;
+mod nu_worker;
+mod task_runner;
 mod types;
 
 use app::GrmApp;
@@ -9,16 +11,23 @@ use std::sync::mpsc;
 use types::AsyncMessage;
 
 fn main() -> eframe::Result<()> {
-    // 1. Create the Tokio runtime for background networking tasks
+    // --- 1. MULTI-CALL BINARY INTERCEPTOR ---
+    // If the binary is called with --nu-worker, we bypass the GUI entirely.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--nu-worker" {
+        nu_worker::run();
+        // nu_worker::run() calls process::exit(), so execution will never reach here.
+        return Ok(());
+    }
+
+    // --- 2. NORMAL GUI BOOTUP ---
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create Tokio runtime");
 
-    // 2. Create the message channel (Worker -> UI thread)
     let (tx, rx) = mpsc::channel::<AsyncMessage>();
 
-    // 3. Setup the eframe window
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([900.0, 700.0])

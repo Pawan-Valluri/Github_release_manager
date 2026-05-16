@@ -1,4 +1,4 @@
-use crate::types::{Project, ReleaseMetadata};
+use crate::types::{PipelineTask, Project, ReleaseMetadata};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -13,7 +13,11 @@ pub struct ManifestProject {
     #[serde(default)]
     pub allow_prerelease: bool,
     #[serde(default)]
-    pub asset_regex: Option<String>, // NEW
+    pub asset_regex: Option<String>,
+    #[serde(default)]
+    pub current_asset_name: Option<String>,
+    #[serde(default)]
+    pub pipeline: Vec<PipelineTask>, // NEW
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -39,6 +43,8 @@ pub fn load_manifest(install_folder: &str) -> Vec<Project> {
                 release_info: None,
                 allow_prerelease: false,
                 asset_regex: None,
+                current_asset_name: None,
+                pipeline: vec![],
             }],
         };
         if let Ok(json) = serde_json::to_string_pretty(&default_manifest) {
@@ -75,7 +81,9 @@ pub fn load_manifest(install_folder: &str) -> Vec<Project> {
                     is_expanded: false,
                     release_info: mp.release_info.clone(),
                     allow_prerelease: mp.allow_prerelease,
-                    asset_regex: mp.asset_regex.clone(), // NEW
+                    asset_regex: mp.asset_regex.clone(),
+                    current_asset_name: mp.current_asset_name.clone(),
+                    pipeline: mp.pipeline.clone(), // NEW
                 });
             }
         }
@@ -97,7 +105,9 @@ pub fn save_manifest(install_folder: &str, projects: &[Project]) {
                 last_local_update: Utc::now().to_rfc3339(), // Stamp it with right now!
                 release_info: p.release_info.clone(),
                 allow_prerelease: p.allow_prerelease,
-                asset_regex: p.asset_regex.clone(), // NEW
+                asset_regex: p.asset_regex.clone(),
+                current_asset_name: p.current_asset_name.clone(),
+                pipeline: p.pipeline.clone(), // NEW
             }
         })
         .collect();
